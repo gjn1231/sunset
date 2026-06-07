@@ -22,6 +22,7 @@
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -125,6 +126,217 @@ def predict_sunsethue(lat, lng, date_str, event_type="sunset"):
     return data
 
 
+# ── 黄金/蓝调时刻（太阳高度角天文算法） ─────────────────
+
+def _julian_day(year, month, day):
+    """计算儒略日，返回 UT 子夜 (0h UT) 的 JD（民用日约定，.0=子夜）"""
+    if month <= 2:
+        year -= 1
+        month += 12
+    A = year // 100
+    B = 2 - A + A // 4
+    # +0.5 将天文 JD (.0=正午) 转为民用 JD (.0=子夜)
+    return int(365.25 * (year + 4716)) + int(30.6001 * (month + 1)) + day + B - 1525.0
+
+
+def _solar_position(lat, lng, jd):
+    """
+    计算太阳高度角和方位角。
+    基于 NOAA Solar Calculator 算法。
+    返回 (elevation_deg, azimuth_deg)
+    """
+    # 自 J2000.0 以来的儒略世纪数
+    n = jd - 2451545.0
+
+    # 太阳平均经度
+    L = (280.460 + 0.9856474 * n) % 360
+
+    # 太阳平均近点角
+    g = (357.528 + 0.9856003 * n) % 360
+    g_rad = math.radians(g)
+
+    # 黄道经度
+    lam = L + 1.915 * math.sin(g_rad) + 0.020 * math.sin(2 * g_rad)
+
+    # 黄赤交角
+    epsilon = 23.439 - 0.0000004 * n
+
+    # 赤经和赤纬
+    lam_rad = math.radians(lam)
+    eps_rad = math.radians(epsilon)
+    alpha = math.degrees(math.atan2(
+        math.cos(eps_rad) * math.sin(lam_rad),
+        math.cos(lam_rad),
+    ))
+    delta = math.degrees(math.asin(
+        math.sin(eps_rad) * math.sin(lam_rad),
+    ))
+
+    # 格林尼治恒星时
+    GST = (6.6974243242 + 0.0657098283 * n + (jd - int(jd)) * 24) % 24
+    # 地方恒星时
+    lst = (GST + lng / 15) % 24
+
+    # 时角（度）
+    ha = (lst * 15 - alpha + 360) % 360
+    if ha > 180:
+        ha -= 360
+    ha_rad = math.radians(ha)
+
+    lat_rad = math.radians(lat)
+    delta_rad = math.radians(delta)
+
+    # 太阳高度角
+    sin_el = (math.sin(lat_rad) * math.sin(delta_rad) +
+              math.cos(lat_rad) * math.cos(delta_rad) * math.cos(ha_rad))
+    elevation = math.degrees(math.asin(max(-1, min(1, sin_el))))
+
+    # 方位角
+    cos_az = ((math.sin(delta_rad) - math.sin(lat_rad) * math.sin(math.radians(elevation))) /
+              (math.cos(lat_rad) * math.cos(math.radians(elevation))))
+    cos_az = max(-1, min(1, cos_az))
+    azimuth = math.degrees(math.acos(cos_az))
+    if ha > 0:
+        azimuth = 360 - azimuth
+
+    return elevation, azimuth
+
+
+def _find_time_for_elevation(lat, lng, date_str, target_elev, after_noon=True):
+    """
+    用二分法查找太阳到达目标高度角的精确时刻。
+    返回 "HH:MM" 字符串，找不到返回空串。
+    """
+    try:
+        parts = date_str.split("-")
+        y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+    except (ValueError, IndexError):
+        return ""
+
+    jd = _julian_day(y, m, d)
+
+    # 太阳正午的 JD
+    # jd 是 UT 子夜 (0h UT)，太阳正午 = 子夜 + solar_noon_ut 小时
+    solar_noon_ut = 12.0 - lng / 15.0
+    noon_jd = jd + solar_noon_ut / 24.0
+
+    if after_noon:
+        # 下午：太阳从正午高度下降
+        lo = noon_jd
+        hi = noon_jd + 0.5  # 最多到午夜
+    else:
+        # 上午：太阳升起到正午高度
+        lo = noon_jd - 0.5
+        hi = noon_jd
+
+    best_jd = None
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        el, _ = _solar_position(lat, lng, mid)
+
+        if after_noon:
+            # 下午太阳高度递减，el > target 说明还没到（太阳还太高），往后搜
+            if el > target_elev:
+                lo = mid
+            else:
+                hi = mid
+        else:
+            # 上午太阳高度递增，el < target 说明还没到（太阳还太低），往后搜
+            if el < target_elev:
+                lo = mid
+            else:
+                hi = mid
+
+        best_jd = mid
+
+    if best_jd is None:
+        return ""
+
+    # JD → 北京时间 (UTC+8)
+    # 民约日 .0 = UT 子夜，直接取小数部分即为 UT 天数
+    ut_hours = (best_jd - int(best_jd)) * 24  # 当天 UT 小时数
+    cst_hours = (ut_hours + 8) % 24
+
+    h = int(cst_hours)
+    m = int((cst_hours - h) * 60 + 0.5)  # 四舍五入到分钟
+    if m == 60:
+        m = 0
+        h = (h + 1) % 24
+    return f"{h:02d}:{m:02d}"
+
+
+def calc_golden_blue_hours(lat, lng, date_str):
+    """
+    精确计算黄金时段和蓝调时刻。
+
+    定义（摄影师标准）：
+      黄金时段：太阳高度角 +6° → -4°
+      蓝调时刻：太阳高度角 -4° → -6°
+
+    返回 {"golden_start": "HH:MM", "golden_end": "HH:MM",
+           "blue_start": "HH:MM", "blue_end": "HH:MM"}
+    """
+    gold_start = _find_time_for_elevation(lat, lng, date_str, 6.0, after_noon=True)
+    gold_end = _find_time_for_elevation(lat, lng, date_str, -4.0, after_noon=True)
+    blue_start = gold_end  # 蓝调从黄金时段结束开始
+    blue_end = _find_time_for_elevation(lat, lng, date_str, -6.0, after_noon=True)
+
+    return {
+        "golden_start": gold_start,
+        "golden_end": gold_end,
+        "blue_start": blue_start,
+        "blue_end": blue_end,
+    }
+
+
+# ── AOD 气溶胶光学厚度（Open-Meteo Air Quality API） ──
+
+def fetch_aod(lat, lng):
+    """
+    从 Open-Meteo Air Quality API 获取 AOD 550nm 数据。
+    免费，无需 API key。数据来源：CAMS 全球大气成分预报。
+    返回 dict 或 None（失败时）
+    """
+    params = urllib.parse.urlencode({
+        "latitude": lat, "longitude": lng,
+        "hourly": "aerosol_optical_depth",
+        "timezone": "Asia/Shanghai",
+        "forecast_days": 1,
+    })
+    url = f"https://air-quality-api.open-meteo.com/v1/air-quality?{params}"
+    try:
+        data = _http_get(url)
+        if "_error" in data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def extract_aod_at_sunset(aod_data, sunset_hour=18):
+    """从 AOD 数据中提取日落时段的均值"""
+    hourly = aod_data.get("hourly", {}) if aod_data else {}
+    times = hourly.get("time", [])
+    aod_vals = hourly.get("aerosol_optical_depth", [])
+
+    if not times or not aod_vals:
+        return None
+
+    # 找日落前后 3h 窗口的 AOD 均值
+    today = datetime.now(TZ_CST).strftime("%Y-%m-%d")
+    target_prefix = today + "T"
+    window = []
+    for t, v in zip(times, aod_vals):
+        if t.startswith(target_prefix) and v is not None:
+            h = int(t.split("T")[1].split(":")[0])
+            if sunset_hour - 1 <= h <= sunset_hour + 2:
+                window.append(v)
+
+    if not window:
+        return None
+    return sum(window) / len(window)
+
+
 # ── 引擎 2：Open-Meteo 免费 API ───────────────────────────
 
 def fetch_openmeteo(lat, lng):
@@ -143,13 +355,14 @@ def fetch_openmeteo(lat, lng):
     return _http_get(url)
 
 
-def compute_sunset_quality(meteo_data, day_index=0, event_type="sunset"):
+def compute_sunset_quality(meteo_data, day_index=0, event_type="sunset", aod_value=None):
     """
-    🔬 研究驱动型晚霞评分引擎 v2.0
+    🔬 研究驱动型晚霞评分引擎 v2.1
 
     基于以下研究结论：
     1. AOD(气溶胶光学厚度) = 最重要的单一特征（Henriksson 2019, Chen 2022）
-       → 无AOD数据时用能见度+湿度作代理
+       → v2.1: 接入 CAMS 真实 AOD 550nm 数据（Open-Meteo Air Quality API）
+       → 无AOD时降级为能见度代理
     2. 高云（卷云/卷积云 5-13km）是晚霞最佳散射介质，非低云
     3. 总云量 15-70% 为最优区间，非30-60%
     4. 云型配置 > 单层云量，多层云=纹理加分
@@ -248,23 +461,53 @@ def compute_sunset_quality(meteo_data, day_index=0, event_type="sunset"):
         score += 0.04
         factors["high_cloud_texture"] = 0.04
 
-    # ── 2. 能见度评分 (权重 ~25%，AOD代理) ──
-    # 能见度 >20km = 通透，12-20km = 良好，<8km = 雾霾
-    # （中国城市平均能见度5-10km，15km+已接近通透）
-    if vis_km is None:
-        factors["visibility_score"] = 0
-    elif vis_km >= 20:
-        score += 0.18
-        factors["visibility_score"] = 0.18
-    elif vis_km >= 12:
-        score += 0.12
-        factors["visibility_score"] = 0.12
-    elif vis_km >= 6:
-        score += 0.05
-        factors["visibility_score"] = 0.05
+    # ── 2. AOD/能见度评分 (权重 ~25%) ──
+    # v2.1: 优先使用真实 AOD 550nm 数据（Henriksson 2019 #1 特征）
+    # 中等 AOD (0.15-0.45) 最佳——气溶胶散射红光增强晚霞
+    # AOD 太低 → 色彩平淡；AOD 太高 → 雾霾遮挡
+    if aod_value is not None:
+        factors["aod_source"] = "CAMS 550nm"
+        factors["aod_value"] = round(aod_value, 3)
+        if 0.15 <= aod_value <= 0.45:
+            score += 0.18
+            factors["aod_score"] = 0.18
+            factors["aod_note"] = "optimal"
+        elif 0.45 < aod_value <= 0.70:
+            score += 0.10
+            factors["aod_score"] = 0.10
+            factors["aod_note"] = "good"
+        elif 0.70 < aod_value <= 0.90:
+            score += 0.03
+            factors["aod_score"] = 0.03
+            factors["aod_note"] = "hazy"
+        elif aod_value > 0.90:
+            score -= 0.10
+            factors["aod_score"] = -0.10
+            factors["aod_note"] = "too_hazy"
+        else:  # < 0.15, very clean air
+            score += 0.05
+            factors["aod_score"] = 0.05
+            factors["aod_note"] = "too_clean"
     else:
-        score -= 0.08  # 能见度极差 = 严重雾霾
-        factors["visibility_score"] = -0.08
+        # 降级：能见度代理
+        if vis_km is None:
+            factors["aod_score"] = 0
+        elif vis_km >= 20:
+            score += 0.18
+            factors["aod_score"] = 0.18
+            factors["aod_note"] = "vis_excellent"
+        elif vis_km >= 12:
+            score += 0.12
+            factors["aod_score"] = 0.12
+            factors["aod_note"] = "vis_good"
+        elif vis_km >= 6:
+            score += 0.05
+            factors["aod_score"] = 0.05
+            factors["aod_note"] = "vis_moderate"
+        else:
+            score -= 0.08
+            factors["aod_score"] = -0.08
+            factors["aod_note"] = "vis_poor"
 
     # ── 3. 湿度评分 (权重 ~15%) ──
     # 40-60% 最佳；>80% 雾蒙蒙；<30% 太干
@@ -464,7 +707,7 @@ def _est_golden_hour(sunset_time):
         return "", ""
 
 
-def format_discord_message(result, location_name, date_str, event_type):
+def format_discord_message(result, location_name, date_str, event_type, gh=None):
     """生成 Discord 格式消息"""
     quality = result.get("quality", 0)
     emoji = quality_emoji(quality)
@@ -542,8 +785,18 @@ def format_discord_message(result, location_name, date_str, event_type):
         if parts:
             lines.append(f"☁️ 云量：{' · '.join(parts)}")
 
-        # 能见度
-        if vis is not None:
+        # AOD / 能见度
+        aod_val = result.get("aod_value") or factors.get("aod_value")
+        if aod_val is not None:
+            aod_note = factors.get("aod_note", "")
+            if aod_note == "optimal":
+                aod_icon = "🔬 AOD"
+            elif aod_note in ("good", "good_enough"):
+                aod_icon = "🔬 AOD"
+            else:
+                aod_icon = "🔬 AOD"
+            lines.append(f"{aod_icon}：{aod_val:.3f} (550nm) {'✅ 最佳散射' if aod_note=='optimal' else '👍 良好' if aod_note=='good' else '⚠️ 偏雾' if aod_note=='hazy' else '❌ 严重雾霾' if aod_note=='too_hazy' else '🌫️ 过于清洁'}")
+        elif vis is not None:
             lines.append(f"👁️ 能见度：{vis:.1f}km{' ✅通透' if vis >= 20 else ' ✅良好' if vis >= 12 else ' ⚠️一般' if vis >= 6 else ' ❌雾霾'}")
 
         # 湿度
@@ -563,11 +816,17 @@ def format_discord_message(result, location_name, date_str, event_type):
             conf_stars = "🟢高" if conf >= 0.85 else "🟡中" if conf >= 0.65 else "🔴低"
             lines.append(f"🎯 置信度：{conf:.0%}（{conf_stars}）")
 
-        gold, blue = _est_golden_hour(sunset_t or "18:40")
-        if gold:
-            lines.append(f"⏰ 黄金时段（估）：{gold}")
-        if blue:
-            lines.append(f"⏰ 蓝色时刻（估）：{blue}")
+        # 精确黄金/蓝调时刻
+        if gh and gh.get("golden_start"):
+            lines.append(f"⏰ 黄金时段：{gh['golden_start']} — {gh['golden_end']} ✨精确")
+            if gh.get("blue_end"):
+                lines.append(f"⏰ 蓝调时刻：{gh['blue_start']} — {gh['blue_end']} ✨精确")
+        else:
+            gold, blue = _est_golden_hour(sunset_t or "18:40")
+            if gold:
+                lines.append(f"⏰ 黄金时段（估）：{gold}")
+            if blue:
+                lines.append(f"⏰ 蓝色时刻（估）：{blue}")
 
     # 拍摄建议
     lines.append("")
@@ -685,9 +944,15 @@ def send_feishu(webhook_url, result, location_name, date_str, event_type):
     else:
         conf_str = "—"
 
-    gold, blue = _est_golden_hour(sunset_t or "18:40")
-    gold_str = gold if gold else "—"
-    blue_str = blue if blue else "—"
+    # v2.1: 优先使用精确天文计算
+    gh = result.get("golden_hour", {}) or {}
+    if gh.get("golden_start"):
+        gold_str = f"{gh['golden_start']} — {gh['golden_end']}"
+        blue_str = f"{gh.get('blue_start', '—')} — {gh.get('blue_end', '—')}"
+    else:
+        gold, blue = _est_golden_hour(sunset_t or "18:40")
+        gold_str = (gold or "—") + " (估)"
+        blue_str = (blue or "—") + " (估)"
 
     # 拍摄建议
     if quality >= 0.75:
@@ -708,12 +973,23 @@ def send_feishu(webhook_url, result, location_name, date_str, event_type):
 
     # ── 组装丰富版飞书卡片 ──
     # 用 lark_md 表格 + 分区，信息密度高且可读
+    # AOD / 能见度行
+    aod_val = result.get("aod_value") or factors.get("aod_value")
+    if aod_val is not None:
+        aod_note = factors.get("aod_note", "")
+        aod_label = {"optimal": "✅ 最佳散射", "good": "👍 良好",
+                      "hazy": "⚠️ 偏雾", "too_hazy": "❌ 严重雾霾",
+                      "too_clean": "🌫️ 过于清洁"}.get(aod_note, "")
+        aero_line = f"🔬 **AOD (550nm)**：{aod_val:.3f} {aod_label}\n"
+    else:
+        aero_line = f"👁️ **能见度**：{vis_str}\n"
+
     markdown_body = (
         f"**{emoji} 评分：{quality:.0%} — {label}**\n\n"
         f"🌇 **日落**：{sunset_t or '—'}\n"
         f"☁️ **云型**：{cloud_desc}\n"
         f"☁️ **云量**：{cloud_detail}\n"
-        f"👁️ **能见度**：{vis_str}\n"
+        f"{aero_line}"
         f"💧 **湿度**：{hu_str}\n"
     )
     if rp > 0:
@@ -853,10 +1129,18 @@ def run_test(location, lat, lng, webhook_url):
                 val = r.get(key)
                 return fmt.format(val) if val is not None else '-'
             print(f"     云: 高{v('cloud_cover_high', '{:.0f}')}% · 中{v('cloud_cover_mid', '{:.0f}')}% · 低{v('cloud_cover_low', '{:.0f}')}% · 总{v('total_cloud_cover', '{:.0f}')}%")
+            aod = r.get('aod_value')
             vis = r.get('visibility_km')
-            print(f"     能见度: {f'{vis:.1f}km' if vis else '—'}  湿度: {v('humidity', '{:.0f}')}%  降水: {r.get('rain_probability',0):.0f}%")
-            gold, blue = _est_golden_hour(_sunset_cst(r.get('sunset_time','')) or '18:40')
-            print(f"     黄金时段: {gold or '—'}  蓝调: {blue or '—'}")
+            if aod is not None:
+                print(f"     🔬 AOD: {aod:.3f} (550nm)  湿度: {v('humidity', '{:.0f}')}%  降水: {r.get('rain_probability',0):.0f}%")
+            else:
+                print(f"     能见度: {f'{vis:.1f}km' if vis else '—'}  湿度: {v('humidity', '{:.0f}')}%  降水: {r.get('rain_probability',0):.0f}%")
+            gh = r.get('golden_hour', {}) or {}
+            if gh.get('golden_start'):
+                print(f"     ⏰ 黄金: {gh['golden_start']}—{gh['golden_end']}  蓝调: {gh.get('blue_start','?')}—{gh.get('blue_end','?')} ✨精确")
+            else:
+                gold, blue = _est_golden_hour(_sunset_cst(r.get('sunset_time','')) or '18:40')
+                print(f"     ⏰ 黄金(估): {gold or '—'}  蓝调(估): {blue or '—'}")
     print()
 
     # ── 5. 飞书 Webhook ──
@@ -1028,11 +1312,28 @@ def run_prediction(location=None, lat=None, lng=None,
         if "_error" in meteo:
             return {"error": f"Open-Meteo 请求失败: {meteo['_error']}", "source": "failed"}
 
-        raw = compute_sunset_quality(meteo, day_index=day_index, event_type=event_type)
+        # v2.1: 获取 AOD 数据
+        aod_val = None
+        aod_data = fetch_aod(resolved_lat, resolved_lng)
+        if aod_data:
+            sunset_h = 18
+            st = meteo.get("daily", {}).get("sunset", [""] * 3)[day_index] or ""
+            if st and "T" in st:
+                try:
+                    sunset_h = int(st.split("T")[1].split(":")[0])
+                except (ValueError, IndexError):
+                    pass
+            aod_val = extract_aod_at_sunset(aod_data, sunset_h)
+
+        raw = compute_sunset_quality(meteo, day_index=day_index,
+                                     event_type=event_type, aod_value=aod_val)
         if raw is None or "error" in (raw or {}):
             return {"error": f"云量解析失败: {raw}", "source": "failed"}
 
-    discord_msg = format_discord_message(raw, location_name, date_str, event_type)
+    # v2.1: 精确黄金/蓝调时刻
+    gh = calc_golden_blue_hours(resolved_lat, resolved_lng, date_str)
+
+    discord_msg = format_discord_message(raw, location_name, date_str, event_type, gh)
     short_summary = f"{quality_emoji(raw['quality'])} {location_name} {date_str}: {raw['quality']:.0%}"
 
     return {
@@ -1044,7 +1345,7 @@ def run_prediction(location=None, lat=None, lng=None,
         "event_type": event_type,
         "short_summary": short_summary,
         "discord_message": discord_msg,
-        # 原始数据透传，供测试/外部使用
+        # 原始数据透传
         "cloud_cover_low": raw.get("cloud_cover_low"),
         "cloud_cover_mid": raw.get("cloud_cover_mid"),
         "cloud_cover_high": raw.get("cloud_cover_high"),
@@ -1056,6 +1357,8 @@ def run_prediction(location=None, lat=None, lng=None,
         "sunrise_time": raw.get("sunrise_time"),
         "confidence": raw.get("confidence"),
         "factors": raw.get("factors", {}),
+        "golden_hour": gh,
+        "aod_value": raw.get("aod_value") if "aod_value" in raw else raw.get("factors", {}).get("aod_value"),
     }
 
 
