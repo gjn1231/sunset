@@ -24,9 +24,14 @@
 import json
 import os
 import sys
+import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+
+# Fix Windows console encoding for emoji output (🌅🔥☁️ etc.)
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # ── 城市坐标映射 ─────────────────────────────────────────────
 
@@ -337,7 +342,7 @@ def compute_sunset_quality(meteo_data, day_index=0, event_type="sunset"):
 # ── 位置解析 ────────────────────────────────────────────────
 
 def resolve_location(location=None, lat=None, lng=None):
-    """级联位置解析：手动坐标 > 城市名 > 环境变量 > 默认杭州"""
+    """级联位置解析（单地点）：手动坐标 > 城市名 > 环境变量 > 默认杭州"""
     if lat is not None and lng is not None:
         return float(lat), float(lng), f"({lat},{lng})"
 
@@ -353,6 +358,55 @@ def resolve_location(location=None, lat=None, lng=None):
             return loc[0], loc[1], env_loc
 
     return 30.2741, 120.1551, "杭州"
+
+
+def parse_locations(location=None, lat=None, lng=None):
+    """
+    解析多地点。支持逗号分隔。
+    返回 [(lat, lng, name), ...] 列表。
+
+    示例：
+        --location 杭州,北京,上海
+        --lat 30.27,39.90 --lng 120.15,116.40
+        --location 杭州 --lat 34.80 --lng 114.31   (混合)
+    """
+    locs = []
+
+    # ── 城市名（逗号分隔） ──
+    if location:
+        for name in location.split(","):
+            name = name.strip()
+            if name:
+                loc = LOCATION_MAP.get(name)
+                if loc:
+                    locs.append((loc[0], loc[1], name))
+                else:
+                    print(f"⚠️ 未知城市: {name}，已跳过")
+
+    # ── 经纬度（逗号分隔） ──
+    if lat is not None and lng is not None:
+        lats = [x.strip() for x in str(lat).split(",")]
+        lngs = [x.strip() for x in str(lng).split(",")]
+        if len(lats) != len(lngs):
+            print(f"⚠️ lat 和 lng 数量不匹配，经纬度部分已跳过")
+        else:
+            for i, (la, lo) in enumerate(zip(lats, lngs)):
+                try:
+                    locs.append((float(la), float(lo), f"({la},{lo})"))
+                except ValueError:
+                    print(f"⚠️ 经纬度格式错误: {la},{lo}")
+
+    # ── 兜底：啥也没配就用环境变量/默认杭州 ──
+    if not locs:
+        env_loc = os.environ.get("SUNSET_LOCATION", "")
+        if env_loc:
+            loc = LOCATION_MAP.get(env_loc)
+            if loc:
+                locs.append((loc[0], loc[1], env_loc))
+        if not locs:
+            locs.append((30.2741, 120.1551, "杭州"))
+
+    return locs
 
 
 # ── 格式化输出 ──────────────────────────────────────────────
@@ -543,15 +597,403 @@ def format_discord_message(result, location_name, date_str, event_type):
     return "\n".join(lines)
 
 
+# ── 飞书推送 ────────────────────────────────────────────────
+
+def send_feishu(webhook_url, result, location_name, date_str, event_type):
+    """将晚霞预报推送到飞书群（自定义机器人 Webhook）—— 丰富版卡片"""
+    quality = result["quality"]
+    emoji = quality_emoji(quality)
+    label = quality_label(quality)
+
+    event_label = "晚霞" if event_type == "sunset" else "朝霞"
+    icon = "🌅" if event_type == "sunset" else "🌄"
+
+    # 卡片颜色
+    if quality >= 0.75:
+        color = "red"
+    elif quality >= 0.60:
+        color = "orange"
+    elif quality >= 0.50:
+        color = "yellow"
+    elif quality >= 0.35:
+        color = "wathet"
+    else:
+        color = "grey"
+
+    sunset_t = _sunset_cst(result.get("sunset_time", "")) if event_type == "sunset" else ""
+
+    factors = result.get("factors", {})
+    cloud_type = factors.get("cloud_type", "")
+    cloud_desc = {
+        "high_cloud_dominant": "高云主导 🔥 散射最佳",
+        "low_cloud_dominant": "低云主导",
+        "mixed": "混合云层",
+        "clear": "晴空 · 无云散射",
+        "overcast": "阴天 · 光线遮挡 ⚠️",
+    }.get(cloud_type, "—")
+
+    low_c = result.get("cloud_cover_low")
+    mid_c = result.get("cloud_cover_mid")
+    high_c = result.get("cloud_cover_high")
+    total_c = result.get("total_cloud_cover")
+
+    cloud_parts = []
+    if high_c is not None: cloud_parts.append(f"高{high_c:.0f}%")
+    if mid_c is not None: cloud_parts.append(f"中{mid_c:.0f}%")
+    if low_c is not None: cloud_parts.append(f"低{low_c:.0f}%")
+    if total_c is not None: cloud_parts.append(f"总{total_c:.0f}%")
+    cloud_detail = " · ".join(cloud_parts) if cloud_parts else "—"
+
+    vis = result.get("visibility_km")
+    if vis is not None:
+        if vis >= 20:
+            vis_str = f"{vis:.1f}km ✅ 通透"
+        elif vis >= 12:
+            vis_str = f"{vis:.1f}km ✅ 良好"
+        elif vis >= 6:
+            vis_str = f"{vis:.1f}km ⚠️ 一般"
+        else:
+            vis_str = f"{vis:.1f}km ❌ 雾霾"
+    else:
+        vis_str = "—"
+
+    hu = result.get("humidity")
+    if hu is not None:
+        if 40 <= hu <= 60:
+            hu_str = f"{hu:.0f}% ✅ 最佳"
+        elif 30 <= hu < 40 or 60 < hu <= 75:
+            hu_str = f"{hu:.0f}% 👍 良好"
+        elif hu > 85:
+            hu_str = f"{hu:.0f}% ⚠️ 偏湿"
+        else:
+            hu_str = f"{hu:.0f}%"
+    else:
+        hu_str = "—"
+
+    rp = result.get("rain_probability", 0)
+
+    conf = result.get("confidence")
+    if conf is not None:
+        if conf >= 0.85:
+            conf_str = f"{conf:.0%} 🟢 高"
+        elif conf >= 0.65:
+            conf_str = f"{conf:.0%} 🟡 中"
+        else:
+            conf_str = f"{conf:.0%} 🔴 低"
+    else:
+        conf_str = "—"
+
+    gold, blue = _est_golden_hour(sunset_t or "18:40")
+    gold_str = gold if gold else "—"
+    blue_str = blue if blue else "—"
+
+    # 拍摄建议
+    if quality >= 0.75:
+        tips = "🔥 今晚必出！提前 1h 到场踩光\n• 三脚架必备 · 带反光板补面光\n• 穿暖色系（橙/红/黄）更融晚霞"
+    elif quality >= 0.50:
+        tips = "👍 值得出工\n• 提前 30min 到场 · 找开阔方向\n• 建议带反光板"
+    elif quality >= 0.35:
+        tips = "🤔 可拍可不拍\n• 如果出工，后期多拉饱和度+暖色调"
+    else:
+        tips = "🏠 建议改天\n• 拍室内、夜景或改期吧"
+
+    # 杭州机位
+    spots_text = ""
+    if location_name == "杭州" and quality >= 0.25:
+        limit = 3 if quality < 0.60 else 5
+        spots_list = [f"• {s} — {d}" for s, d in HANGZHOU_SPOTS[:limit]]
+        spots_text = "\n".join(spots_list)
+
+    # ── 组装丰富版飞书卡片 ──
+    # 用 lark_md 表格 + 分区，信息密度高且可读
+    markdown_body = (
+        f"**{emoji} 评分：{quality:.0%} — {label}**\n\n"
+        f"🌇 **日落**：{sunset_t or '—'}\n"
+        f"☁️ **云型**：{cloud_desc}\n"
+        f"☁️ **云量**：{cloud_detail}\n"
+        f"👁️ **能见度**：{vis_str}\n"
+        f"💧 **湿度**：{hu_str}\n"
+    )
+    if rp > 0:
+        markdown_body += f"🌧️ **降水概率**：{rp:.0f}%\n"
+    markdown_body += (
+        f"🎯 **置信度**：{conf_str}\n"
+        f"⏰ **黄金时段**：{gold_str}\n"
+        f"⏰ **蓝调时刻**：{blue_str}\n"
+    )
+
+    card_elements = [
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": markdown_body.strip()},
+        },
+        {"tag": "hr"},
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"📸 **拍摄建议**\n{tips}"},
+        },
+    ]
+
+    if spots_text:
+        card_elements.append({"tag": "hr"})
+        card_elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"📍 **推荐机位（{location_name}）**\n{spots_text}"},
+        })
+
+    card_elements.append({"tag": "hr"})
+    card_elements.append({
+        "tag": "note",
+        "elements": [{
+            "tag": "plain_text",
+            "content": f"🕐 预报更新：{datetime.now(TZ_CST).strftime('%H:%M')} CST · 数据：Open-Meteo · {result.get('source', 'open-meteo')}",
+        }],
+    })
+
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"{icon} {location_name} {event_label}预报 · {date_str}",
+                },
+                "template": color,
+            },
+            "elements": card_elements,
+        },
+    }
+
+    req = urllib.request.Request(
+        webhook_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp_body = json.loads(resp.read().decode())
+            return resp_body
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+# ── 测试诊断 ────────────────────────────────────────────────
+
+def run_test(location, lat, lng, webhook_url):
+    """运行诊断测试，验证所有组件是否正常。"""
+    results = {"pass": 0, "fail": 0, "checks": []}
+
+    def check(name, ok, detail=""):
+        mark = "✅" if ok else "❌"
+        line = f"  {mark} {name}{' — ' + detail if detail else ''}"
+        results["checks"].append(line)
+        print(line)
+        if ok:
+            results["pass"] += 1
+        else:
+            results["fail"] += 1
+
+    print("═" * 55)
+    print("🔧 晚霞预报 v2.0 — 诊断测试")
+    print("═" * 55)
+    print()
+
+    # ── 1. 系统环境 ──
+    print("📋 系统环境")
+    check("Python 版本", sys.version_info >= (3, 7),
+          f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+    check("操作系统", True, sys.platform)
+    check("编码", sys.stdout.encoding == "utf-8" or True, sys.stdout.encoding or "unknown")
+    print()
+
+    # ── 2. 网络连接 ──
+    print("🌐 网络连接")
+    try:
+        req = urllib.request.Request(
+            "https://api.open-meteo.com/v1/forecast?latitude=30.27&longitude=120.15&daily=sunset&timezone=Asia/Shanghai&forecast_days=1",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            has_daily = "daily" in data
+            sunset = data.get("daily", {}).get("sunset", ["?"])[0]
+        check("Open-Meteo API", has_daily, f"日落时间: {sunset}")
+    except Exception as e:
+        check("Open-Meteo API", False, str(e))
+    print()
+
+    # ── 3. 位置解析 ──
+    print("📍 位置解析")
+    locs = parse_locations(location=location, lat=lat, lng=lng)
+    check("位置解析", len(locs) > 0, f"共 {len(locs)} 个地点")
+    for lat_val, lng_val, name in locs:
+        print(f"     📍 {name} ({lat_val}, {lng_val})")
+    print()
+
+    # ── 4. 预测引擎 ──
+    print("🧠 预测引擎")
+    for lat_val, lng_val, name in locs:
+        result = run_prediction(lat=lat_val, lng=lng_val, label=name)
+        if "error" in result:
+            check(f"预报 [{name}]", False, result["error"])
+        else:
+            q = result["quality"]
+            s = result["short_summary"]
+            check(f"预报 [{name}]", True, f"评分 {q:.0%}")
+            print(f"     {s}")
+
+            # 详细数据
+            r = result
+            print(f"     日落: {_sunset_cst(r.get('sunset_time','')) or '—'}")
+            def v(key, fmt='{}'):
+                """安全取值，None 显示为 -"""
+                val = r.get(key)
+                return fmt.format(val) if val is not None else '-'
+            print(f"     云: 高{v('cloud_cover_high', '{:.0f}')}% · 中{v('cloud_cover_mid', '{:.0f}')}% · 低{v('cloud_cover_low', '{:.0f}')}% · 总{v('total_cloud_cover', '{:.0f}')}%")
+            vis = r.get('visibility_km')
+            print(f"     能见度: {f'{vis:.1f}km' if vis else '—'}  湿度: {v('humidity', '{:.0f}')}%  降水: {r.get('rain_probability',0):.0f}%")
+            gold, blue = _est_golden_hour(_sunset_cst(r.get('sunset_time','')) or '18:40')
+            print(f"     黄金时段: {gold or '—'}  蓝调: {blue or '—'}")
+    print()
+
+    # ── 5. 飞书 Webhook ──
+    print("📤 飞书推送")
+    if webhook_url:
+        print(f"  Webhook: {webhook_url[:50]}...")
+        for lat_val, lng_val, name in locs:
+            result = run_prediction(lat=lat_val, lng=lng_val, label=name)
+            if "error" in result:
+                check(f"飞书推送 [{name}]", False, result["error"])
+            else:
+                fs_resp = send_feishu(webhook_url, result, name,
+                                      result["date"], result["event_type"])
+                if "_error" in fs_resp:
+                    check(f"飞书推送 [{name}]", False,
+                          f"发送失败: {fs_resp['_error']}")
+                else:
+                    code = fs_resp.get("code", -1)
+                    msg = fs_resp.get("msg", "")
+                    check(f"飞书推送 [{name}]", code == 0,
+                          f"code={code} {msg}")
+    else:
+        print("  ⚠️ 未配置 Webhook，跳过推送测试")
+        print("  设置方法：--feishu <URL> 或 FEISHU_WEBHOOK_URL 环境变量")
+    print()
+
+    # ── 6. 总结 ──
+    print("═" * 55)
+    total = results["pass"] + results["fail"]
+    print(f"📊 测试结果: {results['pass']}/{total} 通过"
+          + (f", {results['fail']} 失败" if results['fail'] else " ✅ 全部通过"))
+    print("═" * 55)
+
+    return results["fail"] == 0
+
+
+# ── 守护模式 ────────────────────────────────────────────────
+
+def serve_daemon(location, lat, lng, webhook_url, push_time_str="16:00"):
+    """
+    守护模式：后台常驻，每天定点推送（支持多地点）。
+
+    参数：
+        location: 城市名，逗号分隔（如 "杭州,北京,上海"）
+        lat, lng: 经纬度，逗号分隔（如 "30.27,39.90"）
+        webhook_url: 飞书 Webhook URL（可选）
+        push_time_str: 推送时间，格式 "HH:MM"（默认 16:00）
+    """
+    try:
+        push_hour, push_minute = map(int, push_time_str.split(":"))
+    except ValueError:
+        print(f"❌ 时间格式错误: {push_time_str}，应为 HH:MM")
+        sys.exit(1)
+
+    # ── 解析所有地点 ──
+    locations = parse_locations(location=location, lat=lat, lng=lng)
+    loc_names = [name for _, _, name in locations]
+
+    print("═" * 55)
+    print("🌅  晚霞预报服务 v2.0")
+    print("═" * 55)
+    print(f"   地点数量： {len(locations)}")
+    for _, _, name in locations:
+        print(f"     📍 {name}")
+    print(f"   推送时间： 每天 {push_hour:02d}:{push_minute:02d} CST")
+    print(f"   飞书推送： {'✅ 已配置' if webhook_url else '⚠️ 未配置，仅本地输出'}")
+    print("═" * 55)
+    print()
+
+    # ── 对单个地点执行预测+推送 ──
+    def push_one(lat_val, lng_val, name, label=""):
+        prefix = f"[{name}]" if label else ""
+        result = run_prediction(lat=lat_val, lng=lng_val, label=name)
+        if "error" in result:
+            print(f"  {prefix} ❌ {result['error']}")
+            return
+        print(f"  {prefix} {result['short_summary']}")
+        if webhook_url:
+            fs_resp = send_feishu(webhook_url, result, name,
+                                  result["date"], result["event_type"])
+            if "_error" in fs_resp:
+                print(f"  {prefix} ⚠️ 飞书失败: {fs_resp['_error']}")
+            else:
+                print(f"  {prefix} ✅ 已推送")
+        return result
+
+    # ── 立即跑一次（启动时） ──
+    print("🚀 启动时预报:\n")
+    for lat_val, lng_val, name in locations:
+        push_one(lat_val, lng_val, name)
+        time.sleep(1)  # 避免请求过快
+    print()
+
+    # ── 循环等待 ──
+    while True:
+        now = datetime.now(TZ_CST)
+        next_push = now.replace(hour=push_hour, minute=push_minute,
+                                second=0, microsecond=0)
+        if now >= next_push:
+            next_push += timedelta(days=1)
+
+        wait_sec = (next_push - now).total_seconds()
+        wait_hours = wait_sec / 3600
+        print(f"⏳ 下次推送：{next_push.strftime('%Y-%m-%d %H:%M')} CST "
+              f"({wait_hours:.1f}h 后，共 {len(locations)} 个地点)")
+        print("   (按 Ctrl+C 停止服务)\n")
+
+        try:
+            time.sleep(wait_sec)
+        except KeyboardInterrupt:
+            print("\n👋 晚霞预报服务已停止")
+            break
+
+        # ── 到点推送所有地点 ──
+        print("═" * 55)
+        print(f"📤 {datetime.now(TZ_CST).strftime('%Y-%m-%d %H:%M')} 定时推送:")
+        print("═" * 55)
+        for lat_val, lng_val, name in locations:
+            push_one(lat_val, lng_val, name)
+            time.sleep(1)
+        print()
+
+
 # ── 主流程 ──────────────────────────────────────────────────
 
 def run_prediction(location=None, lat=None, lng=None,
-                   date_str=None, event_type="sunset"):
+                   date_str=None, event_type="sunset", label=None):
     """
     执行日落/日出质量预测。
+
+    参数：
+        location: 城市名
+        lat, lng: 经纬度
+        label: 显示名称（优先级最高，用于多地点时携带原始地名）
     返回 dict { quality, source, discord_message, short_summary, ... }
     """
     resolved_lat, resolved_lng, location_name = resolve_location(location, lat, lng)
+    if label:
+        location_name = label  # 外部传入的名称优先
 
     if not date_str:
         date_str = datetime.now(TZ_CST).strftime("%Y-%m-%d")
@@ -600,6 +1042,18 @@ def run_prediction(location=None, lat=None, lng=None,
         "event_type": event_type,
         "short_summary": short_summary,
         "discord_message": discord_msg,
+        # 原始数据透传，供测试/外部使用
+        "cloud_cover_low": raw.get("cloud_cover_low"),
+        "cloud_cover_mid": raw.get("cloud_cover_mid"),
+        "cloud_cover_high": raw.get("cloud_cover_high"),
+        "total_cloud_cover": raw.get("total_cloud_cover"),
+        "visibility_km": raw.get("visibility_km"),
+        "humidity": raw.get("humidity"),
+        "rain_probability": raw.get("rain_probability"),
+        "sunset_time": raw.get("sunset_time"),
+        "sunrise_time": raw.get("sunrise_time"),
+        "confidence": raw.get("confidence"),
+        "factors": raw.get("factors", {}),
     }
 
 
@@ -608,39 +1062,100 @@ def run_prediction(location=None, lat=None, lng=None,
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="🌅 晚霞/朝霞预测")
-    parser.add_argument("--location", type=str, default=None)
-    parser.add_argument("--lat", type=float, default=None)
-    parser.add_argument("--lng", type=float, default=None)
+    parser.add_argument("--location", type=str, default=None,
+                        help="城市名，逗号分隔（如 '杭州,北京,上海'）")
+    parser.add_argument("--lat", type=str, default=None,
+                        help="纬度，逗号分隔（如 '30.27,39.90'）")
+    parser.add_argument("--lng", type=str, default=None,
+                        help="经度，逗号分隔（如 '120.15,116.40'）")
     parser.add_argument("--date", type=str, default=None)
     parser.add_argument("--type", dest="event_type", type=str,
                         default="sunset", choices=["sunset", "sunrise"])
     parser.add_argument("--discord", action="store_true")
+    parser.add_argument("--feishu", type=str, default=None,
+                        help="飞书 Webhook URL（也支持 FEISHU_WEBHOOK_URL 环境变量）")
+    parser.add_argument("--serve", action="store_true",
+                        help="守护模式：后台常驻，每天定时推送")
+    parser.add_argument("--serve-time", type=str, default="16:00",
+                        help="守护模式推送时间，格式 HH:MM（默认 16:00）")
+    parser.add_argument("--test", action="store_true",
+                        help="诊断测试：验证所有组件是否正常")
     parser.add_argument("--short", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    result = run_prediction(
-        location=args.location, lat=args.lat, lng=args.lng,
-        date_str=args.date, event_type=args.event_type,
-    )
+    # ── 测试模式 ──
+    if args.test:
+        feishu_url = args.feishu or os.environ.get("FEISHU_WEBHOOK_URL", "")
+        ok = run_test(
+            location=args.location, lat=args.lat, lng=args.lng,
+            webhook_url=feishu_url,
+        )
+        sys.exit(0 if ok else 1)
 
-    if "error" in result:
-        print(f"❌ {result['error']}")
-        sys.exit(1)
+    # ── 守护模式 ──
+    if args.serve:
+        feishu_url = args.feishu or os.environ.get("FEISHU_WEBHOOK_URL", "")
+        serve_daemon(
+            location=args.location, lat=args.lat, lng=args.lng,
+            webhook_url=feishu_url, push_time_str=args.serve_time,
+        )
+        return
 
-    if args.short:
-        print(result["short_summary"])
-    elif args.json:
-        print(json.dumps({
-            "quality": result["quality"],
-            "source": result["source"],
-            "location": result["location"],
-            "date": result["date"],
-            "short": result["short_summary"],
-        }, ensure_ascii=False, indent=2))
-    else:
-        # --discord or plain
-        print(result["discord_message"])
+    # ── 一键模式（支持多地点） ──
+    locations = parse_locations(location=args.location, lat=args.lat, lng=args.lng)
+    feishu_url = args.feishu or os.environ.get("FEISHU_WEBHOOK_URL", "")
+
+    all_results = []
+    for lat_val, lng_val, name in locations:
+        result = run_prediction(
+            lat=lat_val, lng=lng_val,
+            date_str=args.date, event_type=args.event_type, label=name,
+        )
+
+        if "error" in result:
+            print(f"❌ [{name}] {result['error']}")
+            continue
+
+        all_results.append(result)
+
+        # ── 飞书推送 ──
+        if feishu_url:
+            fs_resp = send_feishu(feishu_url, result, name,
+                                  result["date"], result["event_type"])
+            if "_error" in fs_resp:
+                print(f"⚠️ [{name}] 飞书推送失败: {fs_resp['_error']}")
+            else:
+                print(f"✅ [{name}] 已推送到飞书")
+
+        if args.short:
+            print(result["short_summary"])
+        elif not args.json:
+            # 纯文本输出
+            if len(locations) > 1:
+                print(f"\n{'─' * 50}")
+                print(f"📍 {name}")
+                print(f"{'─' * 50}")
+            print(result["discord_message"])
+
+    if args.json and all_results:
+        if len(all_results) == 1:
+            r = all_results[0]
+            print(json.dumps({
+                "quality": r["quality"],
+                "source": r["source"],
+                "location": r["location"],
+                "date": r["date"],
+                "short": r["short_summary"],
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps([{
+                "location": r["location"],
+                "quality": r["quality"],
+                "source": r["source"],
+                "date": r["date"],
+                "short": r["short_summary"],
+            } for r in all_results], ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
